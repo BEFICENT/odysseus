@@ -1,0 +1,9 @@
+# Opt in to the locally built trust-corrected image without publishing a tag.
+# Run from the repository root with the base Compose file first.
+services:
+  searxng:
+    image: localhost/odysseus-searxng:2026.9.25-ca-trust
+    build:
+      context: .
+      dockerfile: docker/searxng/Dockerfile
+      target: runtime

@@ -1,0 +1,243 @@
+name: ci / SearXNG image
+
+on:
+  pull_request:
+    paths:
+      - 'docker/searxng/**'
+      - 'tests/fixtures/ca-trust/**'
+      - 'tests/test_searxng*'
+      - 'docker-compose*.yml'
+      - 'config/searxng/**'
+      - 'scripts/migrate_searxng_settings.py'
+      - '.github/scripts/*searxng*'
+      - '.github/searxng-validation.compose.yml'
+      - '.github/workflows/searxng-image.yml'
+  push:
+    branches: [dev, main, release/searxng-ca-trust]
+    paths:
+      - 'docker/searxng/**'
+      - 'tests/fixtures/ca-trust/**'
+      - 'docker-compose*.yml'
+      - 'config/searxng/**'
+      - 'scripts/migrate_searxng_settings.py'
+      - '.github/scripts/*searxng*'
+      - '.github/searxng-validation.compose.yml'
+      - '.github/workflows/searxng-image.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish after native validation (canonical trusted branches only)
+        type: boolean
+        default: false
+
+concurrency:
+  group: searxng-image-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: SearXNG validate (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Reproduce affected base
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/searxng/Dockerfile
+          target: baseline-validation
+          network: none
+          platforms: ${{ matrix.platform }}
+          no-cache-filters: baseline-validation
+          cache-from: type=gha,scope=searxng-${{ matrix.arch }}
+      - name: Validate repaired stores and upstream startup
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/searxng/Dockerfile
+          target: validation
+          network: none
+          platforms: ${{ matrix.platform }}
+          no-cache-filters: validation
+          cache-from: type=gha,scope=searxng-${{ matrix.arch }}
+      - name: Build runtime without registry credentials
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/searxng/Dockerfile
+          target: runtime
+          network: none
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: localhost/odysseus-searxng:ci-${{ matrix.arch }}
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=searxng-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=searxng-${{ matrix.arch }}
+      - name: Validate actual runtime through Compose and live HTTPS
+        env:
+          SEARXNG_TEST_IMAGE: localhost/odysseus-searxng:ci-${{ matrix.arch }}
+        run: bash .github/scripts/validate-searxng-image.sh "$SEARXNG_TEST_IMAGE"
+      - name: Export validated runtime and input checksums
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker save --output "$RUNNER_TEMP/runtime-${ARCH}.tar" "localhost/odysseus-searxng:ci-${ARCH}"
+          python3 .github/scripts/searxng_release.py inputs --revision "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/inputs-${ARCH}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: searxng-runtime-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/runtime-${{ matrix.arch }}.tar
+            ${{ runner.temp }}/inputs-${{ matrix.arch }}.json
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish validated SearXNG architectures and index
+    needs: validate
+    if: >-
+      github.repository == 'odysseus-dev/odysseus' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) &&
+      contains(fromJSON('["refs/heads/dev","refs/heads/main","refs/heads/release/searxng-ca-trust"]'), github.ref)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.release.outputs.image }}
+    env:
+      SEARXNG_IMAGE: ghcr.io/odysseus-dev/odysseus-searxng
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/searxng-artifacts
+          pattern: searxng-runtime-*
+          merge-multiple: true
+      - name: Load and inspect the validated artifacts before registry login
+        run: |
+          for arch in amd64 arm64; do
+            docker load --input "$RUNNER_TEMP/searxng-artifacts/runtime-${arch}.tar"
+            image="localhost/odysseus-searxng:ci-${arch}"
+            test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = "linux/${arch}"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$GITHUB_SHA"
+          done
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the exact validated artifacts
+        id: release
+        run: |
+          tag="sha-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          refs=()
+          for arch in amd64 arm64; do
+            remote="${SEARXNG_IMAGE}:${tag}-${arch}"
+            docker tag "localhost/odysseus-searxng:ci-${arch}" "$remote"
+            docker push "$remote"
+            digests=$(docker image inspect --format '{{json .RepoDigests}}' "$remote")
+            ref=$(jq -er --arg prefix "${SEARXNG_IMAGE}@" '.[] | select(startswith($prefix))' <<< "$digests")
+            [[ "$ref" =~ ^ghcr.io/odysseus-dev/odysseus-searxng@sha256:[0-9a-f]{64}$ ]]
+            refs+=("$ref")
+          done
+          docker buildx imagetools create --tag "${SEARXNG_IMAGE}:${tag}" "${refs[@]}"
+          docker buildx imagetools inspect "${SEARXNG_IMAGE}:${tag}" --format '{{json .Manifest}}' > "$RUNNER_TEMP/searxng-manifest.json"
+          python3 .github/scripts/searxng_release.py release \
+            --amd64 "$RUNNER_TEMP/searxng-artifacts/inputs-amd64.json" \
+            --arm64 "$RUNNER_TEMP/searxng-artifacts/inputs-arm64.json" \
+            --manifest "$RUNNER_TEMP/searxng-manifest.json" --revision "$GITHUB_SHA" \
+            --amd64-digest "${refs[0]#*@}" --arm64-digest "${refs[1]#*@}" \
+            --run-id "$GITHUB_RUN_ID" --tag "$tag" --output "$RUNNER_TEMP/searxng-release.json"
+          image=$(jq -er .image "$RUNNER_TEMP/searxng-release.json")
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: searxng-release-candidate
+          path: ${{ runner.temp }}/searxng-release.json
+          if-no-files-found: error
+          retention-days: 30
+
+  verify-published:
+    name: Verify public SearXNG pull (${{ matrix.arch }})
+    needs: publish
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pull the published index without registry credentials
+        env:
+          SEARXNG_TEST_IMAGE: ${{ needs.publish.outputs.image }}
+        run: |
+          if ! docker pull "$SEARXNG_TEST_IMAGE"; then
+            echo '::error::Anonymous GHCR pull failed. A newly created package defaults to private: make odysseus-searxng public, then rerun the failed verification jobs.'
+            exit 1
+          fi
+      - name: Validate the pulled runtime through Compose
+        env:
+          SEARXNG_TEST_IMAGE: ${{ needs.publish.outputs.image }}
+        run: bash .github/scripts/validate-searxng-image.sh "$SEARXNG_TEST_IMAGE"
+
+  release:
+    name: Record verified Compose image reference
+    needs: [publish, verify-published]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: searxng-release-candidate
+          path: ${{ runner.temp }}/searxng-release
+      - name: Record the verified image
+        env:
+          SEARXNG_VERIFIED_IMAGE: ${{ needs.publish.outputs.image }}
+        run: |
+          {
+            echo '## Verified SearXNG image'
+            echo
+            echo "\`$SEARXNG_VERIFIED_IMAGE\`"
+            echo
+            echo 'Both native architectures passed Compose startup, fourteen incident-chain/HTTPS checks and live search before and after publication.'
+            echo 'Pin this reference in the base and standalone GPU Compose files and commit the release descriptor.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: searxng-release
+          path: ${{ runner.temp }}/searxng-release/searxng-release.json
+          if-no-files-found: error
+          retention-days: 30

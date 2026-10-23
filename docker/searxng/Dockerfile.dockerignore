@@ -1,0 +1,8 @@
+**
+!docker/
+!docker/searxng/
+!docker/searxng/**
+!tests/
+!tests/fixtures/
+!tests/fixtures/ca-trust/
+!tests/fixtures/ca-trust/incident.json
