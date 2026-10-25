@@ -327,16 +327,10 @@ class SemanticIntent:
     required_read: RequiredReadOperation | None
 
 
-def interpret_request(request_text, *, history=(), workspace=None, active_document=False,
-                      image_attachment=False):
-    if not isinstance(request_text, str):
-        raise TypeError("Intent requires request text")
-    # Routing may use model/tool history. Admission may only inherit intent
-    # from trusted user requests; a model's proposal or attempted tool call
-    # cannot establish a new authorized operation class.
-    history = tuple(history or ())
+def _trusted_user_history(history):
+    """Model proposals and injected user-shaped context cannot supply grants."""
     trusted_history = []
-    for row in history:
+    for row in history or ():
         get = row.get if isinstance(row, dict) else lambda key, default=None: getattr(row, key, default)
         metadata = get("metadata") or {}
         if isinstance(metadata, str):
@@ -347,6 +341,42 @@ def interpret_request(request_text, *, history=(), workspace=None, active_docume
         if (get("role") == "user" and isinstance(metadata, dict)
                 and metadata.get("trusted") is not False and not metadata.get("tool_gate_untrusted")):
             trusted_history.append({"role": "user", "content": get("content", "")})
+    return tuple(trusted_history)
+
+
+_RETRY_REQUEST = re.compile(
+    r"\s*(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:"
+    r"retry|continue|go\s+on|(?:try|do|run)(?:\s+(?:it|that|this))?\s+again"
+    r"|(?:it\s+)?failed(?:\s+again)?|(?:it\s+)?still\s+(?:not\s+working|failing|fails)"
+    r"|same\s+(?:error|issue)|try\s+(?:another\s+way|different\s+sources)"
+    r")(?:\s+please)?[.!?]*\s*", re.I,
+)
+
+
+def _retry_origin(request_text, history):
+    if not _RETRY_REQUEST.fullmatch(request_text):
+        return None
+    # The route may already have appended the current user turn. Skip only
+    # explicit retries, never an intervening topic, cancellation, or thanks.
+    # Bound chains so an old request cannot silently regain authority.
+    for row in reversed(_trusted_user_history(history)[-8:]):
+        content = row["content"]
+        if not isinstance(content, str) or not content.strip():
+            return None
+        if not _RETRY_REQUEST.fullmatch(content):
+            return content
+    return None
+
+
+def interpret_request(request_text, *, history=(), workspace=None, active_document=False,
+                      image_attachment=False):
+    if not isinstance(request_text, str):
+        raise TypeError("Intent requires request text")
+    # Routing may use model/tool history. Admission may only inherit intent
+    # from trusted user requests; a model's proposal or attempted tool call
+    # cannot establish a new authorized operation class.
+    history = tuple(history or ())
+    trusted_history = _trusted_user_history(history)
     families = requested_capabilities(request_text, trusted_history,
         active_document=active_document, workspace=bool(workspace), image_attachment=image_attachment)
     selected = selected_tools_for_request(request_text)
@@ -367,6 +397,20 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
     """Deterministic server policy over semantic facts, never schema inventory."""
     if not isinstance(request_text, str):
         raise TypeError("Authority requires trusted request text")
+    origin = _retry_origin(request_text, history)
+    if origin is not None:
+        # Re-admit the original user request, including its exact selectors,
+        # rather than granting the router's or model's current tool inventory.
+        # Fresh owner/session/workspace bindings and current policy still apply.
+        authority = create_request_authority(
+            origin, owner=owner, session_id=session_id, workspace=workspace,
+            policy=policy, active_document=active_document,
+            image_attachment=image_attachment, capabilities=capabilities,
+            client_runtime_context=client_runtime_context,
+        )
+        return authority.restrict(
+            build_effective_tool_policy(last_user_message=origin)
+        ).restrict(build_effective_tool_policy(last_user_message=request_text))
     intent = interpret_request(request_text, history=history, active_document=active_document,
                                workspace=workspace, image_attachment=image_attachment)
     families = intent.capabilities
