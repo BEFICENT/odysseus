@@ -484,7 +484,7 @@ def test_new_session_does_not_inherit_source_transcript_permissions(scope_db, tm
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("actor", ["alice", None])
-@pytest.mark.parametrize("runtime", ["normal", "preview", "experiment"])
+@pytest.mark.parametrize("runtime", ["normal", "preview", "experiment", "full", "native", "tui"])
 @pytest.mark.parametrize("message", [
     "The notes belong to the diagram, and the ordering depends on their geometry.",
     "Let us revisit your observations.",
@@ -502,7 +502,8 @@ async def test_chat_route_uses_saved_scope_for_arbitrary_prose_and_read_only_con
     admit(tmp_path, owner=actor, session_id="session-1")
     captured = {}
     endpoint = _chat_stream_endpoint(monkeypatch, "agent", captured)
-    monkeypatch.setattr(routes, "uses_compact_preview_runtime", lambda *args, **kwargs: runtime != "normal")
+    monkeypatch.setattr(routes, "uses_compact_preview_runtime", lambda *args, **kwargs: runtime in {"preview", "experiment"})
+    monkeypatch.setattr(routes, "_configured_model_tool_surface", lambda *args, **kwargs: "full" if runtime == "full" else "")
     if runtime == "experiment":
         import src.tool_routing_experiment as experiment
         monkeypatch.setattr(experiment, "experiment_mode", lambda *args, **kwargs: "all")
@@ -519,6 +520,11 @@ async def test_chat_route_uses_saved_scope_for_arbitrary_prose_and_read_only_con
     monkeypatch.setattr(routes, "stream_agent_loop", model)
     request = _RouteRequest("agent")
     request._form.update(message=message, workspace=str(tmp_path), compare_mode="false", allow_bash="true")
+    if runtime in {"native", "tui"}:
+        request._form["client_runtime_context"] = json.dumps({
+            "surface": "odysseus-native" if runtime == "native" else "odysseus-tui",
+            "terminal_agent": True, "unattended_mode": True,
+        })
     response = await endpoint(request)
     async for _ in response.body_iterator:
         pass

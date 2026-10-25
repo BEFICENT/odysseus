@@ -3580,6 +3580,11 @@ def setup_chat_routes(
                 exact_tool_approval.pending.request_authority
                 or RequestAuthority.empty(owner=_user, session_id=session, workspace=workspace)
             ).restrict(tool_policy)
+        if _request_authority.task_continuation and exact_tool_approval is None:
+            # A saved scope supplies its own ceiling independently of compact
+            # intent routing. Full-schema and native surfaces must retain it
+            # too, including on turns with no newly classified tool intent.
+            _use_turn_contract = True
         _turn_contract = None
         # Image models execute directly, not through the text-agent inventory.
         # Keep the permission policy above, but do not apply routing omissions
