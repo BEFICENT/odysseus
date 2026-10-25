@@ -282,6 +282,8 @@ class SessionReadScope(Base):
     # A fresh unguessable lease on every change also prevents ABA after deletion.
     token = Column(String, nullable=False)
     authority_json = Column(Text, nullable=True)  # NULL is a durable revocation.
+    # Previous turn's fresh admission; one bare confirmation may reuse it.
+    carry_json = Column(Text, nullable=True)
     run_id = Column(String, nullable=True)
 
 

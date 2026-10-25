@@ -23,8 +23,9 @@ CLARIFICATION = "The numeric labels are obsolete; use the cards inside the group
 @pytest.fixture
 def scope_db(monkeypatch):
     engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
-    database.Base.metadata.create_all(engine, tables=[database.Session.__table__, database.ChatMessage.__table__,
-                                                      database.SessionReadScope.__table__])
+    # The full schema: route tests reach other tables (for example MCP servers)
+    # depending on what earlier tests in the same process have loaded.
+    database.Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine)
     monkeypatch.setattr(database, "SessionLocal", factory)
     with factory() as db:
@@ -125,6 +126,88 @@ def test_explicit_writes_use_fresh_admission_without_becoming_persistent_mutatio
     later = admit(tmp_path, "A different angle would help.")
     for tool in ("write_file", "edit_file", "bash", "manage_documents"):
         assert not permits(later, tool)
+
+
+@pytest.mark.parametrize("text", [
+    "Fix the off-by-one in sample.txt", "Add a docstring to main.py", "Change the loop bound to len(items)",
+    "Rewrite the function", "Refactor main.py to use enumerate", "Insert a guard clause at the top",
+    "Yes, fix it", "Run the tests",
+])
+def test_followup_workspace_changes_use_saved_scope_not_transcript(scope_db, tmp_path, text):
+    admit(tmp_path)
+    current = admit(tmp_path, text, history=())
+    assert not current.task_continuation
+    assert permits(current, "write_file") and permits(current, "read_file")
+    # The change is admitted for this turn only; the saved scope stays read-only.
+    later = admit(tmp_path, "A different angle would help.")
+    assert later.task_continuation and permits(later, "read_file")
+    assert not permits(later, "write_file")
+
+
+@pytest.mark.parametrize("text", ["Fix the off-by-one in sample.txt", "Rewrite the function", "Yes, do it"])
+def test_without_saved_scope_followup_changes_get_no_transcript_grants(scope_db, tmp_path, text):
+    history = [{"role": "user", "content": "Edit sample.txt in the workspace to fix the typo"}]
+    current = admit(tmp_path, text, history=history)
+    assert not permits(current, "write_file") and not permits(current, "bash")
+
+
+def test_confirmation_reuses_previous_admission_for_one_turn(scope_db, tmp_path):
+    admit(tmp_path)
+    change = admit(tmp_path, "Edit sample.txt to fix the typo")
+    assert permits(change, "write_file")
+    confirmed = admit(tmp_path, "Yes, go ahead.")
+    assert not confirmed.task_continuation
+    assert permits(confirmed, "write_file") and permits(confirmed, "read_file")
+    assert confirmed.request_id != change.request_id and scope_is_current(confirmed)
+    assert not scope_is_current(change)
+    # A second approval has nothing left to approve.
+    again = admit(tmp_path, "yes")
+    assert again.task_continuation and not permits(again, "write_file")
+
+
+@pytest.mark.parametrize("prompt", [
+    "Continue from where you left off.",
+    "You hit the step limit before finishing — the task is not complete. Continue from exactly where you "
+    "left off and keep going until it is done. Do NOT repeat work already done.",
+])
+def test_client_resume_prompts_reuse_previous_admission(scope_db, tmp_path, prompt):
+    admit(tmp_path, "Edit sample.txt to fix the typo")
+    assert permits(admit(tmp_path, prompt), "write_file")
+
+
+def test_any_stop_clears_carried_grant_without_rotating_newer_lease(scope_db, tmp_path):
+    change = admit(tmp_path, "Edit sample.txt to fix the typo")
+    assert not invalidate_scope("conversation", expected_run_id="run-without-lease")
+    assert scope_is_current(change)
+    confirmed = admit(tmp_path, "Yes, do it")
+    assert permits(confirmed, "read_file") and not permits(confirmed, "write_file")
+
+
+@pytest.mark.parametrize("between", ["A different angle would help.", "Stop the analysis", "Do not read any files"])
+def test_confirmation_cannot_skip_an_intervening_turn_or_revocation(scope_db, tmp_path, between):
+    admit(tmp_path, "Edit sample.txt to fix the typo")
+    admit(tmp_path, between)
+    assert not permits(admit(tmp_path, "Yes, do it"), "write_file")
+
+
+@pytest.mark.parametrize("change", ["invalidate", "workspace", "owner", "policy"])
+def test_confirmation_is_bound_to_lease_workspace_owner_and_current_policy(scope_db, tmp_path, change):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    admit(first, "Edit sample.txt to fix the typo")
+    kwargs = {}
+    workspace = first
+    if change == "invalidate":
+        invalidate_scope("conversation")
+    elif change == "workspace":
+        workspace = second
+    elif change == "owner":
+        kwargs["owner"] = "bob"
+    else:
+        kwargs["policy"] = ToolPolicy(disabled_tools={"write_file", "edit_file", "apply_patch", "bash", "python", "host_shell"})
+    confirmed = admit(workspace, "Yes, do it", **kwargs)
+    assert not permits(confirmed, "write_file") and not permits(confirmed, "bash")
 
 
 def test_normal_continuation_does_not_reinterpret_or_reseal_any_history(scope_db, tmp_path, monkeypatch):
@@ -470,6 +553,43 @@ def test_client_history_endpoints_cannot_preserve_or_mint_scope(scope_db, tmp_pa
     assert response.status_code == 200
     assert not scope_is_current(old)
     assert not permits(admit(tmp_path, "A different angle would help."), "read_file")
+
+
+@pytest.mark.parametrize("operation", ["slash", "assistant", "merge"])
+def test_slash_records_and_continued_replies_keep_scope(scope_db, tmp_path, monkeypatch, operation):
+    from datetime import datetime, timedelta
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from core import session_manager as managers
+    from routes.history import history_routes
+    monkeypatch.setattr(managers, "SessionLocal", scope_db)
+    monkeypatch.setattr(history_routes, "SessionLocal", scope_db)
+    monkeypatch.setattr(history_routes, "_verify_session_owner", lambda *args: None)
+    start = datetime(2026, 1, 1)
+    with scope_db() as db:
+        for number, (role, content) in enumerate([
+            ("user", ORIGIN), ("assistant", "First half"),
+            ("user", "Continue from where you left off."), ("assistant", "second half"),
+        ]):
+            db.add(database.ChatMessage(id=f"m{number}", session_id="conversation", role=role,
+                                        content=content, timestamp=start + timedelta(seconds=number)))
+        db.commit()
+    manager = managers.SessionManager()
+    old = admit(tmp_path)
+    app = FastAPI()
+    app.include_router(history_routes.setup_history_routes(manager))
+    if operation == "merge":
+        path, body = "merge-last-assistant", {"separator": "\n\n"}
+    elif operation == "slash":
+        path, body = "message", {"role": "user", "content": "/help", "metadata": {"source": "slash"}}
+    else:
+        path, body = "message", {"role": "assistant", "content": "Slash command output"}
+    response = TestClient(app).post(f"/api/session/conversation/{path}", json=body)
+    assert response.status_code == 200
+    if operation == "merge":
+        assert response.json()["merged"]
+    assert scope_is_current(old)
+    assert permits(admit(tmp_path, "A different angle would help."), "read_file")
 
 
 def test_new_session_does_not_inherit_source_transcript_permissions(scope_db, tmp_path):

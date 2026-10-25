@@ -478,8 +478,11 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             metadata = sanitize_client_message_metadata(body.get("metadata"))
             _reserve_message_uploads(request, content, metadata)
             msg = ChatMessage(role=role, content=content, metadata=metadata)
-            from src.agent_runtime.conversation_scope import invalidate_scope
-            invalidate_scope(session_id)
+            # Slash-command records and assistant text do not change the
+            # user's request, so they keep the saved read scope.
+            if role != "assistant" and not (isinstance(metadata, dict) and metadata.get("source") == "slash"):
+                from src.agent_runtime.conversation_scope import invalidate_scope
+                invalidate_scope(session_id)
             session_manager.add_message(session_id, msg)
             return {"status": "ok"}
         except KeyError:
@@ -813,8 +816,7 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                         for _row in _merge_continue_rows_to_delete(db_messages, db1, db2):
                             db.delete(_row)
 
-                        from src.agent_runtime.conversation_scope import invalidate_scope
-                        invalidate_scope(session_id, db=db)
+                        # Joining a continued reply changes no user request.
                         db.commit()
             finally:
                 db.close()

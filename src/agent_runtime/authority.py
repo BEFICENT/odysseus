@@ -21,7 +21,6 @@ from src.tool_policy import ToolPolicy, build_effective_tool_policy
 from src.turn_contract import (
     FAMILY_TOOLS, canonical_tool, requested_capabilities,
     RequiredReadOperation, required_read_operation_for_request, selected_tools_for_request,
-    _has_action_signal, _REQUEST_PREFIX,
 )
 
 
