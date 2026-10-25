@@ -18,6 +18,9 @@ from src.agent_runtime.resources import (
     backend_from_dict, intersect_roots, seal_owned_scopes,
 )
 from src.tool_policy import ToolPolicy, build_effective_tool_policy
+from src.agent_runtime.workspace_followups import (
+    WORKSPACE_READ_TOOLS, resolve_workspace_read_continuation,
+)
 from src.turn_contract import (
     FAMILY_TOOLS, canonical_tool, requested_capabilities,
     RequiredReadOperation, required_read_operation_for_request, selected_tools_for_request,
@@ -429,6 +432,34 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
     """Deterministic server policy over semantic facts, never schema inventory."""
     if not isinstance(request_text, str):
         raise TypeError("Authority requires trusted request text")
+    history = tuple(history or ())
+    workspace_context = resolve_workspace_read_continuation(
+        request_text, history, workspace, trusted_user_history=_trusted_user_history,
+        is_retry=_RETRY_REQUEST.fullmatch,
+    )
+    if workspace_context is not None:
+        if workspace_context.request_text is None:
+            authority = RequestAuthority(
+                uuid4().hex, _owner(owner), str(session_id or ""), str(workspace or ""),
+                (OperationGrant("ask_user"), OperationGrant("update_plan")),
+            )
+        else:
+            authority = create_request_authority(
+                workspace_context.request_text, owner=owner, session_id=session_id, workspace=workspace,
+                history=workspace_context.history, policy=policy, active_document=active_document,
+                image_attachment=image_attachment, capabilities=capabilities,
+                client_runtime_context=client_runtime_context,
+            )
+            # Retain the original grants, including exact input/action limits.
+            # Incidental product nouns must not add Notes or shell permissions.
+            authority = replace(authority, grants=tuple(
+                grant for grant in authority.grants
+                if grant.tool in WORKSPACE_READ_TOOLS | {"ask_user", "update_plan"}
+            ))
+        authority = authority.restrict(policy)
+        for text in workspace_context.restrictions:
+            authority = authority.restrict(build_effective_tool_policy(last_user_message=text))
+        return authority
     origin = _retry_origin(request_text, history)
     if origin is not None:
         if origin.request_text is None:

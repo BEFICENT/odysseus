@@ -97,7 +97,7 @@ def test_expanded_cancellation_and_acknowledgment_terminate_retry_authority(boun
 
 def test_original_workspace_analysis_typo_remains_an_eligible_request():
     grant = create_request_authority("failed again", history=[
-        {"role": "user", "content": "can you anaylze the workspace here based on the canvas file"},
+        {"role": "user", "content": "Could you anaylze this workspace canvas?"},
     ])
     assert permitted(grant, "read_file")
 
