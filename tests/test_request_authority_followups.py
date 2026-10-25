@@ -16,6 +16,7 @@ def permitted(authority, tool, content="{}"):
 
 @pytest.mark.parametrize("message", [
     "failed again", "Try it again", "Please retry.", "Still not working", "Continue",
+    "Could you retry now please?", "Please continue now.", "Try it again now!",
 ])
 def test_workspace_retry_retains_requested_file_tools(message, tmp_path):
     grant = create_request_authority(message, workspace=str(tmp_path), history=[
@@ -39,8 +40,9 @@ def test_retry_chain_including_current_message_retains_original_request():
     assert permitted(grant, "read_file")
 
 
-def test_retry_preserves_exact_read_selector():
-    grant = create_request_authority("Try again", history=[
+@pytest.mark.parametrize("retry", ["Try again", "Could you retry now please?"])
+def test_retry_preserves_exact_read_selector(retry):
+    grant = create_request_authority(retry, history=[
         {"role": "user", "content": "Read note id abc123"},
     ])
     assert permitted(grant, "manage_notes", '{"action":"view","id":"abc123"}')
@@ -83,7 +85,7 @@ def test_retry_preserves_historical_selector_and_ignores_later_result_substituti
     "Could you stop reading my notes?", "Yeah, stop reading my notes",
     "I want you to stop reading my notes", "Read my notes? No, stop.",
 ])
-@pytest.mark.parametrize("retry", ["Try again", "Continue"])
+@pytest.mark.parametrize("retry", ["Try again", "Continue", "Please retry now."])
 def test_expanded_cancellation_and_acknowledgment_terminate_retry_authority(boundary, retry):
     grant = create_request_authority(retry, history=[
         {"role": "user", "content": "Read note id abc123"},

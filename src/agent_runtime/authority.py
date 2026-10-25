@@ -353,7 +353,7 @@ _RETRY_REQUEST = re.compile(
     r"retry|continue|go\s+on|(?:try|do|run)(?:\s+(?:it|that|this))?\s+again"
     r"|(?:it\s+)?failed(?:\s+again)?|(?:it\s+)?still\s+(?:not\s+working|failing|fails)"
     r"|same\s+(?:error|issue)|try\s+(?:another\s+way|different\s+sources)"
-    r")(?:\s+please)?[.!?]*\s*", re.I,
+    r")(?:\s+now)?(?:\s+please)?[.!?]*\s*", re.I,
 )
 
 

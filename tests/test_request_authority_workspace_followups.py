@@ -59,6 +59,24 @@ def test_route_history_already_containing_current_user_turn(tmp_path):
     assert allowed(grant, "read_file")
 
 
+@pytest.mark.parametrize("appended_current", [False, True])
+def test_qualified_retry_does_not_break_later_workspace_clarifications(tmp_path, appended_current):
+    retry = "Could you retry now please?"
+    rows = history(tmp_path, CLARIFICATION, DIAGNOSTIC)
+    for message in (retry, CLARIFICATION):
+        if appended_current:
+            rows.append({"role": "user", "content": message})
+        grant = create_request_authority(message, workspace=str(tmp_path), history=rows)
+        assert allowed(grant, "read_file")
+        for tool in ("manage_notes", "write_file", "edit_file", "bash", "python"):
+            assert not allowed(grant, tool)
+        disabled = create_request_authority(message, workspace=str(tmp_path), history=rows,
+                                             policy=ToolPolicy(disabled_tools={"read_file"}))
+        assert not allowed(disabled, "read_file")
+        if not appended_current:
+            rows.append({"role": "user", "content": message})
+
+
 @pytest.mark.parametrize("topic,operation", [
     ("List my saved notes", {"action": "list"}),
     ("Ignore the canvas; list my saved notes", {"action": "list"}),
