@@ -64,7 +64,8 @@ class _FakeSessionManager:
     def save_sessions(self):
         self.saved = True
 
-    def replace_messages(self, session_id, messages):
+    def replace_messages(self, session_id, messages, *, preserve_task_scope=False):
+        assert preserve_task_scope
         if session_id != self.session.id:
             return False
         self.replaced_messages = list(messages)

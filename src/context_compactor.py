@@ -710,6 +710,6 @@ def _update_session_history(session, split_point: int, summary: str,
     except Exception:
         manager = None
     if manager and getattr(session, "id", None):
-        if manager.replace_messages(session.id, new_history):
+        if manager.replace_messages(session.id, new_history, preserve_task_scope=True):
             return
     session.history = new_history

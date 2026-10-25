@@ -693,6 +693,8 @@ def setup_session_routes(
             try:
                 db_session = db.query(DbSession).filter(DbSession.id == sid).first()
                 if db_session:
+                    from src.agent_runtime.conversation_scope import invalidate_scope
+                    invalidate_scope(sid, db=db)
                     db_session.cwd = clean_cwd
                     db_session.updated_at = utcnow_naive()
                     db.commit()
@@ -791,6 +793,8 @@ def setup_session_routes(
                     )
         except (AttributeError, TypeError, ValueError) as exc:
             raise HTTPException(400, "Invalid message attachment metadata") from exc
+        from src.agent_runtime.conversation_scope import invalidate_scope
+        invalidate_scope(sid)
         for m in messages:
             sess.add_message(ChatMessage(
                 m["role"],
@@ -1293,7 +1297,7 @@ def setup_session_routes(
             },
         )
         new_history = [summary_msg] + recent
-        if not session_manager.replace_messages(session_id, new_history):
+        if not session_manager.replace_messages(session_id, new_history, preserve_task_scope=True):
             raise HTTPException(500, "Failed to save compacted history")
 
         # Rough token estimate of the compacted history so clients can

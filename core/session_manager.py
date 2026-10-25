@@ -337,6 +337,8 @@ class SessionManager:
                 DbChatMessage.session_id == session_id
             ).order_by(DbChatMessage.timestamp).all()
 
+            from src.agent_runtime.conversation_scope import invalidate_scope
+            invalidate_scope(session_id, db=db)
             deleted = 0
             for msg in db_messages[keep_count:]:
                 db.delete(msg)
@@ -366,7 +368,7 @@ class SessionManager:
         finally:
             db.close()
 
-    def replace_messages(self, session_id: str, messages: list) -> bool:
+    def replace_messages(self, session_id: str, messages: list, *, preserve_task_scope: bool = False) -> bool:
         """Replace a session's persisted and in-memory history atomically."""
         session = self.get_session(session_id)
         db = SessionLocal()
@@ -393,6 +395,9 @@ class SessionManager:
                         f"Referenced upload is no longer available: {missing_upload_id}"
                     )
 
+            if not preserve_task_scope:
+                from src.agent_runtime.conversation_scope import invalidate_scope
+                invalidate_scope(session_id, db=db)
             db.query(DbChatMessage).filter(DbChatMessage.session_id == session_id).delete()
             now = datetime.now(timezone.utc)
             for i, message in enumerate(messages):

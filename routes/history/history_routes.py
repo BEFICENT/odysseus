@@ -478,6 +478,8 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             metadata = sanitize_client_message_metadata(body.get("metadata"))
             _reserve_message_uploads(request, content, metadata)
             msg = ChatMessage(role=role, content=content, metadata=metadata)
+            from src.agent_runtime.conversation_scope import invalidate_scope
+            invalidate_scope(session_id)
             session_manager.add_message(session_id, msg)
             return {"status": "ok"}
         except KeyError:
@@ -548,6 +550,8 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                     from datetime import datetime, timezone
                     db_session.updated_at = datetime.now(timezone.utc)
 
+                from src.agent_runtime.conversation_scope import invalidate_scope
+                invalidate_scope(session_id, db=db)
                 db.commit()
                 _remove_deleted_sft_trace_rows(
                     owner=effective_user(request),
@@ -606,6 +610,8 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                             hmsg['metadata']['edited'] = True
                         break
 
+                from src.agent_runtime.conversation_scope import invalidate_scope
+                invalidate_scope(session_id, db=db)
                 db.commit()
                 return {"status": "ok"}
             finally:
@@ -807,6 +813,8 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                         for _row in _merge_continue_rows_to_delete(db_messages, db1, db2):
                             db.delete(_row)
 
+                        from src.agent_runtime.conversation_scope import invalidate_scope
+                        invalidate_scope(session_id, db=db)
                         db.commit()
             finally:
                 db.close()

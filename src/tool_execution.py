@@ -1682,6 +1682,9 @@ async def execute_tool_block(
         operation = ExactOperation.normalize(getattr(block, "tool_type", None), getattr(block, "content", None))
         valid = isinstance(authority, RequestAuthority) and authority.bound_to(
             owner=owner, session_id=session_id, workspace=workspace)
+        if valid and authority.task_scope_token:
+            from src.agent_runtime.conversation_scope import scope_is_current
+            valid = scope_is_current(authority)
         if valid:
             authority = authority.restrict(tool_policy, disabled_tools)
         exact_admission = bool(

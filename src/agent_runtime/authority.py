@@ -18,9 +18,6 @@ from src.agent_runtime.resources import (
     backend_from_dict, intersect_roots, seal_owned_scopes,
 )
 from src.tool_policy import ToolPolicy, build_effective_tool_policy
-from src.agent_runtime.workspace_followups import (
-    WORKSPACE_READ_TOOLS, resolve_workspace_read_continuation,
-)
 from src.turn_contract import (
     FAMILY_TOOLS, canonical_tool, requested_capabilities,
     RequiredReadOperation, required_read_operation_for_request, selected_tools_for_request,
@@ -131,6 +128,8 @@ class RequestAuthority:
     job_resources: tuple[BackgroundJobResource, ...] | None = None
     browser_sessions: tuple[BrowserSessionResource, ...] | None = None
     browser_pages: tuple[BrowserPageResource, ...] | None = None
+    task_scope_token: str = ""
+    task_continuation: bool = False
 
     def __post_init__(self):
         if (not isinstance(self.request_id, str) or not self.request_id
@@ -140,7 +139,9 @@ class RequestAuthority:
                 or len({g.tool for g in self.grants}) != len(self.grants)
                 or not isinstance(self.denied, frozenset)
                 or any(not isinstance(n, str) or canonical_tool(n) != n for n in self.denied)
-                or any(type(v) is not bool for v in (self.block_all, self.disable_mcp, self.inherited))):
+                or not isinstance(self.task_scope_token, str)
+                or any(type(v) is not bool for v in (self.block_all, self.disable_mcp, self.inherited,
+                                                    self.task_continuation))):
             raise ValueError("Malformed request authority")
         if self.resource_roots is None:
             roots = ()
@@ -226,6 +227,8 @@ class RequestAuthority:
     def intersect(self, child):
         if not isinstance(child, RequestAuthority):
             raise TypeError("Child authority must be server-owned RequestAuthority")
+        if self.task_scope_token and child.task_scope_token and self.task_scope_token != child.task_scope_token:
+            return RequestAuthority.empty(owner=self.owner, session_id=self.session_id, workspace=self.workspace)
         grants = []
         roots = ()
         backends = ()
@@ -251,13 +254,17 @@ class RequestAuthority:
                        disable_mcp=self.disable_mcp or child.disable_mcp, inherited=True,
                        resource_roots=roots, backend_resources=backends, owned_scopes=owned,
                        launch_scopes=launches, process_resources=processes, job_resources=jobs,
-                       browser_sessions=browser_sessions, browser_pages=browser_pages)
+                       browser_sessions=browser_sessions, browser_pages=browser_pages,
+                       task_scope_token=self.task_scope_token or child.task_scope_token,
+                       task_continuation=self.task_continuation or child.task_continuation)
 
     def continuation(self, *, owner=None, session_id=None):
         """A server continuation may rebind a session, never change owner/grants."""
         if self.owner != _owner(owner):
             return RequestAuthority.empty(owner=owner, session_id=session_id)
         rebound = str(session_id or "")
+        if self.task_scope_token and rebound != self.session_id:
+            return RequestAuthority.empty(owner=owner, session_id=session_id)
         return replace(self, session_id=rebound, inherited=True,
                        owned_scopes=tuple(replace(s, thread_id=rebound) for s in self.owned_scopes) if rebound else (),
                        process_resources=tuple(r for r in self.process_resources if r.thread_id == rebound),
@@ -266,7 +273,8 @@ class RequestAuthority:
                        browser_pages=tuple(r for r in self.browser_pages if r.session.thread_id == rebound))
 
     def to_dict(self):
-        return {"version": 5, "request_id": self.request_id, "owner": self.owner,
+        return {"version": 6, "request_id": self.request_id, "owner": self.owner,
+                "task_scope_token": self.task_scope_token, "task_continuation": self.task_continuation,
                 "session_id": self.session_id, "workspace": self.workspace,
                 "grants": [{"tool": g.tool,
                             "actions": None if g.actions is None else sorted(g.actions),
@@ -285,7 +293,7 @@ class RequestAuthority:
     @classmethod
     def from_dict(cls, value):
         if (not isinstance(value, dict) or type(value.get("version")) is not int
-                or value["version"] not in {1, 2, 3, 4, 5}):
+                or value["version"] not in {1, 2, 3, 4, 5, 6}):
             raise ValueError("Unsupported authority snapshot")
         def limits(value):
             if value is None:
@@ -316,7 +324,9 @@ class RequestAuthority:
                    tuple(ProcessResource.from_dict(r) for r in process_fields["process_resources"]),
                    tuple(BackgroundJobResource.from_dict(r) for r in process_fields["job_resources"]),
                    tuple(BrowserSessionResource.from_dict(r) for r in value["browser_sessions"]) if value["version"] >= 5 else (),
-                   tuple(BrowserPageResource.from_dict(r) for r in value["browser_pages"]) if value["version"] >= 5 else ())
+                   tuple(BrowserPageResource.from_dict(r) for r in value["browser_pages"]) if value["version"] >= 5 else (),
+                   value["task_scope_token"] if value["version"] >= 6 else "",
+                   value["task_continuation"] if value["version"] >= 6 else False)
 
 
 _BROWSER_READ_ACTIONS = frozenset({"open", "navigate", "snapshot", "text", "read", "find",
@@ -348,61 +358,6 @@ def _trusted_user_history(history):
     return tuple(trusted_history)
 
 
-_RETRY_REQUEST = re.compile(
-    r"\s*(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?(?:"
-    r"retry|continue|go\s+on|(?:try|do|run)(?:\s+(?:it|that|this))?\s+again"
-    r"|(?:it\s+)?failed(?:\s+again)?|(?:it\s+)?still\s+(?:not\s+working|failing|fails)"
-    r"|same\s+(?:error|issue)|try\s+(?:another\s+way|different\s+sources)"
-    r")(?:\s+now)?(?:\s+please)?[.!?]*\s*", re.I,
-)
-
-
-_RETRY_BOUNDARY = re.compile(
-    r"(?:^\s*|[;.!?,]\s*|\b(?:but|instead)\s+)" + _REQUEST_PREFIX +
-    r"(?:stop\b|cancel\b|abort\b|pause\b|quit\b|never\b|forget\b"
-    r"|do\s+not\b|don['’]?t\b|no\s+(?:more|need)\b|thanks?\b|thank\s+you\b)", re.I,
-)
-
-_RETRY_ANALYSIS_REQUEST = re.compile(
-    r"\s*" + _REQUEST_PREFIX + r"(?:analy[sz]e|anaylze)\b", re.I,
-)
-
-
-@dataclass(frozen=True)
-class _RetryOrigin:
-    request_text: str | None = None
-    history: tuple = ()
-    restriction_text: str = ""
-
-
-def _retry_origin(request_text, history):
-    if not _RETRY_REQUEST.fullmatch(request_text):
-        return None
-    # The route may already have appended the current user turn. Skip only
-    # explicit retries, never an intervening topic, cancellation, or thanks.
-    # Bound chains so an old request cannot silently regain authority.
-    rows = tuple(history or ())
-    user_turns = 0
-    for index in range(len(rows) - 1, -1, -1):
-        trusted = _trusted_user_history((rows[index],))
-        if not trusted:
-            continue
-        user_turns += 1
-        if user_turns > 8:
-            break
-        content = trusted[0]["content"]
-        if not isinstance(content, str) or not content.strip():
-            break
-        if not _RETRY_REQUEST.fullmatch(content):
-            if (_RETRY_BOUNDARY.search(content)
-                    or not (_has_action_signal(content) or _RETRY_ANALYSIS_REQUEST.match(content))):
-                return _RetryOrigin(restriction_text=content)
-            # Resolve selectors against evidence available when the original
-            # request was admitted. Later retry results cannot change targets.
-            return _RetryOrigin(content, rows[:index])
-    return _RetryOrigin()
-
-
 def interpret_request(request_text, *, history=(), workspace=None, active_document=False,
                       image_attachment=False):
     if not isinstance(request_text, str):
@@ -432,57 +387,6 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
     """Deterministic server policy over semantic facts, never schema inventory."""
     if not isinstance(request_text, str):
         raise TypeError("Authority requires trusted request text")
-    history = tuple(history or ())
-    workspace_context = resolve_workspace_read_continuation(
-        request_text, history, workspace, trusted_user_history=_trusted_user_history,
-        is_retry=_RETRY_REQUEST.fullmatch,
-    )
-    if workspace_context is not None:
-        if workspace_context.request_text is None:
-            authority = RequestAuthority(
-                uuid4().hex, _owner(owner), str(session_id or ""), str(workspace or ""),
-                (OperationGrant("ask_user"), OperationGrant("update_plan")),
-            )
-        else:
-            authority = create_request_authority(
-                workspace_context.request_text, owner=owner, session_id=session_id, workspace=workspace,
-                history=workspace_context.history, policy=policy, active_document=active_document,
-                image_attachment=image_attachment, capabilities=capabilities,
-                client_runtime_context=client_runtime_context,
-            )
-            # Retain the original grants, including exact input/action limits.
-            # Incidental product nouns must not add Notes or shell permissions.
-            authority = replace(authority, grants=tuple(
-                grant for grant in authority.grants
-                if grant.tool in WORKSPACE_READ_TOOLS | {"ask_user", "update_plan"}
-            ))
-        authority = authority.restrict(policy)
-        for text in workspace_context.restrictions:
-            authority = authority.restrict(build_effective_tool_policy(last_user_message=text))
-        return authority
-    origin = _retry_origin(request_text, history)
-    if origin is not None:
-        if origin.request_text is None:
-            # A recognized retry without an eligible origin must not fall
-            # through to ordinary history inference across a closed task.
-            return RequestAuthority(
-                uuid4().hex, _owner(owner), str(session_id or ""), str(workspace or ""),
-                (OperationGrant("ask_user"), OperationGrant("update_plan")),
-            ).restrict(policy or build_effective_tool_policy(last_user_message=request_text)).restrict(
-                build_effective_tool_policy(last_user_message=origin.restriction_text))
-        # Re-admit the original user request, including its exact selectors,
-        # rather than granting the router's or model's current tool inventory.
-        # Fresh owner/session/workspace bindings and current policy still apply.
-        authority = create_request_authority(
-            origin.request_text, owner=owner, session_id=session_id, workspace=workspace,
-            history=origin.history,
-            policy=policy, active_document=active_document,
-            image_attachment=image_attachment, capabilities=capabilities,
-            client_runtime_context=client_runtime_context,
-        )
-        return authority.restrict(
-            build_effective_tool_policy(last_user_message=origin.request_text)
-        ).restrict(build_effective_tool_policy(last_user_message=request_text))
     intent = interpret_request(request_text, history=history, active_document=active_document,
                                workspace=workspace, image_attachment=image_attachment)
     families = intent.capabilities
@@ -543,11 +447,14 @@ def require_user_approval_request(request):
         raise HTTPException(403, "Tool requests cannot submit user approval decisions.")
 
 
-def request_authority_for_http(request, request_text, **context):
+def request_authority_for_http(request, request_text, *, persist_workspace_scope=False, **context):
     """Known tool loopback is a continuation, never a fresh user grant source."""
     if is_internal_tool_request(request):
         return RequestAuthority.empty(owner=context.get("owner"),
             session_id=context.get("session_id"), workspace=context.get("workspace")).restrict(context.get("policy"))
+    if persist_workspace_scope:
+        from src.agent_runtime.conversation_scope import admit_conversation_scope
+        return admit_conversation_scope(request_text, **context)
     return create_request_authority(request_text, **context)
 
 

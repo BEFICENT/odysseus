@@ -274,6 +274,17 @@ class Session(TimestampMixin, Base):
             'crew_member_id': self.crew_member_id,
         }
 
+class SessionReadScope(Base):
+    """Server-only workspace read permission; excluded from session exports."""
+    __tablename__ = "session_read_scopes"
+    session_id = Column(String, ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True)
+    owner = Column(String, nullable=False)
+    # A fresh unguessable lease on every change also prevents ABA after deletion.
+    token = Column(String, nullable=False)
+    authority_json = Column(Text, nullable=True)  # NULL is a durable revocation.
+    run_id = Column(String, nullable=True)
+
+
 class ChatMessage(Base):
     """
     SQLAlchemy model for ChatMessage table.

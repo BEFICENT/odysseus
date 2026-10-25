@@ -3559,8 +3559,12 @@ def setup_chat_routes(
         }
         # Capture permission state before schema selection/reconciliation.
         # Only deterministic request intent supplies grants, never inventory.
+        if not is_internal_tool_request(request) and not incognito and chat_mode != "agent":
+            from src.agent_runtime.conversation_scope import invalidate_scope
+            invalidate_scope(session)
         _request_authority = request_authority_for_http(
             request, message, owner=_user, session_id=session, workspace=workspace,
+            persist_workspace_scope=(chat_mode == "agent" and not incognito and exact_tool_approval is None),
             history=_turn_history, policy=tool_policy,
             client_runtime_context=client_runtime_context,
             active_document=bool(active_doc),
@@ -3697,14 +3701,22 @@ def setup_chat_routes(
             if _corrected_browser_target:
                 _selected_tools = {'private_browser', 'web_fetch', 'web_search'}
                 _required_tools = {'private_browser'}
+            _scope_continuation = _request_authority.task_continuation
+            if _scope_continuation:
+                # The stored scope owns the tool ceiling for arbitrary follow-ups.
+                _turn_capabilities = frozenset({"shell_files"})
+                _active_turn_capabilities = frozenset()
+                _selected_tools = {g.tool for g in _request_authority.grants}
+                _required_tools = set()
+                _warm_tools = set()
             _turn_contract = resolve_turn_contract(
                 capabilities=_turn_capabilities, schemas=_contract_schemas,
                 policy=_contract_policy, required_tools=_required_tools,
                 required_capabilities=_active_turn_capabilities,
                 selected_tools=_selected_tools,
-                always_available_tools=(FAMILY_TOOLS["documents"] if active_doc else ()),
+                always_available_tools=(FAMILY_TOOLS["documents"] if active_doc and not _scope_continuation else ()),
                 warm_tools=_warm_tools,
-                message=message, history=getattr(sess, "history", []) or [],
+                message=None if _scope_continuation else message, history=getattr(sess, "history", []) or [],
             )
             _request_authority = _request_authority.restrict(_contract_policy)
             # Resolution already applies user, owner, and global policy. An
@@ -4992,6 +5004,9 @@ def setup_chat_routes(
                 })
 
         _detached_run = agent_runs.start(session, _safe_stream())
+        from src.agent_runtime.conversation_scope import bind_scope_run
+        if not bind_scope_run(_request_authority, _detached_run.run_id):
+            agent_runs.stop(session, _detached_run.run_id)
         return StreamingResponse(
             agent_runs.subscribe(session, _detached_run),
             media_type="text/event-stream",
@@ -5031,6 +5046,9 @@ def setup_chat_routes(
         _verify_session_owner(request, session_id)
         _expected_run_id = request.headers.get("X-Odysseus-Run-Id")
         stopped = agent_runs.stop(session_id, _expected_run_id)
+        if stopped:
+            from src.agent_runtime.conversation_scope import invalidate_scope
+            invalidate_scope(session_id, expected_run_id=_expected_run_id)
         return {"stopped": stopped}
 
     @router.post("/api/chat/finish/{session_id}")
