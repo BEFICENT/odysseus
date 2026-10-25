@@ -3705,7 +3705,7 @@ def setup_chat_routes(
             if _scope_continuation:
                 # The stored scope owns the tool ceiling for arbitrary follow-ups.
                 _turn_capabilities = frozenset({"shell_files"})
-                _active_turn_capabilities = frozenset()
+                _active_turn_capabilities = frozenset({"shell_files"})
                 _selected_tools = {g.tool for g in _request_authority.grants}
                 _required_tools = set()
                 _warm_tools = set()
@@ -3802,6 +3802,29 @@ def setup_chat_routes(
                         user_text=message,
                         browser_requested=_explicit_browser_intent,
                     )
+            if _scope_continuation:
+                from dataclasses import replace
+                from src.agent_runtime.conversation_scope import WORKSPACE_READ_TOOLS
+                from src.turn_contract import canonical_tool
+                # Preview/experiment formatting may change schemas, never the
+                # saved task's ceiling or its active tool-capable route.
+                _scope_offered = frozenset(name for name in _turn_contract.offered
+                                           if _routed_turn_contract.permits(name))
+                _scope_unavailable = _routed_turn_contract.unavailable | (
+                    _routed_turn_contract.required - _scope_offered)
+                if not any(canonical_tool(name) in WORKSPACE_READ_TOOLS for name in _scope_offered):
+                    _scope_unavailable |= {"capability:shell_files"}
+                if _scope_unavailable:
+                    _scope_offered = frozenset()
+                _turn_contract = replace(
+                    _turn_contract, capabilities=_routed_turn_contract.capabilities,
+                    active_capabilities=_routed_turn_contract.active_capabilities,
+                    required=_routed_turn_contract.required & _scope_offered,
+                    offered=_scope_offered, unavailable=frozenset(_scope_unavailable),
+                    required_read_operation=_routed_turn_contract.required_read_operation,
+                    schema_json=tuple(value for value in _turn_contract.schema_json
+                                      if json.loads(value)["function"]["name"] in _scope_offered),
+                )
             # Every recovery path receives the same scope denial. The central
             # dispatcher also checks the immutable contract after rewrites.
             disabled_tools.update(

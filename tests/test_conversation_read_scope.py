@@ -484,7 +484,13 @@ def test_new_session_does_not_inherit_source_transcript_permissions(scope_db, tm
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("actor", ["alice", None])
-async def test_chat_route_uses_saved_scope_for_arbitrary_prose_and_read_only_contract(scope_db, tmp_path, monkeypatch, actor):
+@pytest.mark.parametrize("runtime", ["normal", "preview", "experiment"])
+@pytest.mark.parametrize("message", [
+    "The notes belong to the diagram, and the ordering depends on their geometry.",
+    "Let us revisit your observations.",
+    "After a fresh file read, what node count and verification code do you observe?",
+])
+async def test_chat_route_uses_saved_scope_for_arbitrary_prose_and_read_only_contract(scope_db, tmp_path, monkeypatch, actor, message, runtime):
     import routes.chat_routes as routes
     import src.tool_security as security
     from tests.test_foreground_model_routing import _RouteRequest, _chat_stream_endpoint
@@ -496,9 +502,12 @@ async def test_chat_route_uses_saved_scope_for_arbitrary_prose_and_read_only_con
     admit(tmp_path, owner=actor, session_id="session-1")
     captured = {}
     endpoint = _chat_stream_endpoint(monkeypatch, "agent", captured)
+    monkeypatch.setattr(routes, "uses_compact_preview_runtime", lambda *args, **kwargs: runtime != "normal")
+    if runtime == "experiment":
+        import src.tool_routing_experiment as experiment
+        monkeypatch.setattr(experiment, "experiment_mode", lambda *args, **kwargs: "all")
     monkeypatch.setattr(routes, "effective_user", lambda request: actor)
     monkeypatch.setattr(security, "owner_is_admin_or_single_user", lambda *args, **kwargs: True)
-    message = "The notes belong to the diagram, and the ordering depends on their geometry."
     monkeypatch.setattr(routes, "coerce_message_and_session", lambda *args, **kwargs: (message, "session-1"))
 
     async def model(*args, **kwargs):
@@ -517,6 +526,8 @@ async def test_chat_route_uses_saved_scope_for_arbitrary_prose_and_read_only_con
     assert permits(captured["authority"], "read_file")
     assert captured["contract"].offered <= WORKSPACE_READ_TOOLS | {"ask_user", "update_plan"}
     assert "read_file" in captured["contract"].offered
+    from src.agent_loop import _contract_allows_early_completion
+    assert not _contract_allows_early_completion(captured["contract"])
     assert not permits(captured["authority"], "manage_notes")
 
 
