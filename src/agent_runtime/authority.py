@@ -21,6 +21,7 @@ from src.tool_policy import ToolPolicy, build_effective_tool_policy
 from src.turn_contract import (
     FAMILY_TOOLS, canonical_tool, requested_capabilities,
     RequiredReadOperation, required_read_operation_for_request, selected_tools_for_request,
+    _has_action_signal, _REQUEST_PREFIX,
 )
 
 
@@ -353,19 +354,50 @@ _RETRY_REQUEST = re.compile(
 )
 
 
+_RETRY_BOUNDARY = re.compile(
+    r"(?:^\s*|[;.!?,]\s*|\b(?:but|instead)\s+)" + _REQUEST_PREFIX +
+    r"(?:stop\b|cancel\b|abort\b|pause\b|quit\b|never\b|forget\b"
+    r"|do\s+not\b|don['’]?t\b|no\s+(?:more|need)\b|thanks?\b|thank\s+you\b)", re.I,
+)
+
+_RETRY_ANALYSIS_REQUEST = re.compile(
+    r"\s*" + _REQUEST_PREFIX + r"(?:analy[sz]e|anaylze)\b", re.I,
+)
+
+
+@dataclass(frozen=True)
+class _RetryOrigin:
+    request_text: str | None = None
+    history: tuple = ()
+    restriction_text: str = ""
+
+
 def _retry_origin(request_text, history):
     if not _RETRY_REQUEST.fullmatch(request_text):
         return None
     # The route may already have appended the current user turn. Skip only
     # explicit retries, never an intervening topic, cancellation, or thanks.
     # Bound chains so an old request cannot silently regain authority.
-    for row in reversed(_trusted_user_history(history)[-8:]):
-        content = row["content"]
+    rows = tuple(history or ())
+    user_turns = 0
+    for index in range(len(rows) - 1, -1, -1):
+        trusted = _trusted_user_history((rows[index],))
+        if not trusted:
+            continue
+        user_turns += 1
+        if user_turns > 8:
+            break
+        content = trusted[0]["content"]
         if not isinstance(content, str) or not content.strip():
-            return None
+            break
         if not _RETRY_REQUEST.fullmatch(content):
-            return content
-    return None
+            if (_RETRY_BOUNDARY.search(content)
+                    or not (_has_action_signal(content) or _RETRY_ANALYSIS_REQUEST.match(content))):
+                return _RetryOrigin(restriction_text=content)
+            # Resolve selectors against evidence available when the original
+            # request was admitted. Later retry results cannot change targets.
+            return _RetryOrigin(content, rows[:index])
+    return _RetryOrigin()
 
 
 def interpret_request(request_text, *, history=(), workspace=None, active_document=False,
@@ -399,17 +431,26 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
         raise TypeError("Authority requires trusted request text")
     origin = _retry_origin(request_text, history)
     if origin is not None:
+        if origin.request_text is None:
+            # A recognized retry without an eligible origin must not fall
+            # through to ordinary history inference across a closed task.
+            return RequestAuthority(
+                uuid4().hex, _owner(owner), str(session_id or ""), str(workspace or ""),
+                (OperationGrant("ask_user"), OperationGrant("update_plan")),
+            ).restrict(policy or build_effective_tool_policy(last_user_message=request_text)).restrict(
+                build_effective_tool_policy(last_user_message=origin.restriction_text))
         # Re-admit the original user request, including its exact selectors,
         # rather than granting the router's or model's current tool inventory.
         # Fresh owner/session/workspace bindings and current policy still apply.
         authority = create_request_authority(
-            origin, owner=owner, session_id=session_id, workspace=workspace,
+            origin.request_text, owner=owner, session_id=session_id, workspace=workspace,
+            history=origin.history,
             policy=policy, active_document=active_document,
             image_attachment=image_attachment, capabilities=capabilities,
             client_runtime_context=client_runtime_context,
         )
         return authority.restrict(
-            build_effective_tool_policy(last_user_message=origin)
+            build_effective_tool_policy(last_user_message=origin.request_text)
         ).restrict(build_effective_tool_policy(last_user_message=request_text))
     intent = interpret_request(request_text, history=history, active_document=active_document,
                                workspace=workspace, image_attachment=image_attachment)

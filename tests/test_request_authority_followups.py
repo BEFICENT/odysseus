@@ -49,6 +49,59 @@ def test_retry_preserves_exact_read_selector():
     assert not permitted(grant, "bash", "pwd")
 
 
+def email_listing(second_uid):
+    return {"role": "assistant", "content": "Two messages listed.", "metadata": {
+        "tool_events": [{"tool": "mcp__email__list_emails", "exit_code": 0,
+                         "output": json.dumps({"stdout":
+                             "1. First\n UID: 111\n Account: Work <work@example.test>\n\n"
+                             f"2. Second\n UID: {second_uid}\n Account: Work <work@example.test>"})}]}}
+
+
+def test_retry_preserves_historical_selector_and_ignores_later_result_substitution():
+    origin = "Read the second email from the earlier inbox list and summarize it."
+    before = [{"role": "user", "content": "List my emails"}, email_listing("222")]
+    original = create_request_authority(origin, history=before)
+    grant = create_request_authority("Try again", history=[
+        *before, {"role": "user", "content": origin}, email_listing("999"),
+        {"role": "user", "content": "Try again"},
+    ])
+    expected = '{"uid":"222","account":"work@example.test"}'
+    assert permitted(original, "read_email", expected)
+    assert permitted(grant, "read_email", expected)
+    assert not permitted(grant, "read_email", '{"uid":"999","account":"work@example.test"}')
+    assert not permitted(grant, "read_email", '{"uid":"111","account":"work@example.test"}')
+    assert not permitted(grant, "delete_email", expected)
+
+
+@pytest.mark.parametrize("boundary", [
+    "Cancel the workspace analysis", "Stop reading the workspace files",
+    "Never mind the workspace analysis", "Thanks for reading the workspace files",
+    "Stop reading my notes", "Thank you for reading my notes",
+    "Do not read my notes", "Please do not read my notes anymore",
+    "Okay, stop reading my notes", "Thanks, the workspace analysis is done",
+    "Never read my notes", "The workspace analysis is complete",
+    "Could you stop reading my notes?", "Yeah, stop reading my notes",
+    "I want you to stop reading my notes", "Read my notes? No, stop.",
+])
+@pytest.mark.parametrize("retry", ["Try again", "Continue"])
+def test_expanded_cancellation_and_acknowledgment_terminate_retry_authority(boundary, retry):
+    grant = create_request_authority(retry, history=[
+        {"role": "user", "content": "Read note id abc123"},
+        {"role": "user", "content": boundary},
+    ])
+    for tool in ("get_workspace", "read_file", "write_file", "manage_notes"):
+        assert not permitted(grant, tool), tool
+    assert not permitted(grant, "bash", "pwd")
+    assert not permitted(grant, "python", "print(1)")
+
+
+def test_original_workspace_analysis_typo_remains_an_eligible_request():
+    grant = create_request_authority("failed again", history=[
+        {"role": "user", "content": "can you anaylze the workspace here based on the canvas file"},
+    ])
+    assert permitted(grant, "read_file")
+
+
 def test_retry_preserves_current_policy():
     grant = create_request_authority("Try again", policy=ToolPolicy(disabled_tools={"read_file"}), history=[
         {"role": "user", "content": WORKSPACE_REQUEST},
@@ -64,6 +117,9 @@ def test_retry_does_not_discard_original_guide_only_restriction():
     assert not permitted(grant, "glob")
     assert not permitted(grant, "read_file")
     assert not permitted(grant, "python", "print(1)")
+    assert grant.block_all
+    assert not permitted(grant, "ask_user")
+    assert not permitted(grant, "update_plan")
 
 
 def test_retry_keeps_web_scope_without_acquiring_shell_execution():
